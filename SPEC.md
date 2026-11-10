@@ -141,6 +141,7 @@ The API is six names:
 
 Rules:
 
+- **Imports and `meta` come first.** A graph starts with its imports and `export const meta`, and `meta` is its only export. The rest of the file becomes the body of an async function, which is what allows top-level `await` and `return`.
 - **TypeScript the language, not Node.** There are no npm packages and no Node APIs. Relative imports between your own files are bundled at `graph add`.
 - **Types are stripped, not checked.** `sheepdog graph types` writes a `sheepdog.d.ts` so the editor and `tsc` do the checking.
 - **Scripts are deterministic.** The clock and random numbers are unavailable, because resume works by replaying the script.
@@ -245,12 +246,12 @@ The design rests on five things that are not yet proven, and each has a small sp
 | Agents may not write the result file reliably | Every branch in a graph depends on structured results | Retry with the validation error; fall back to reading the pane for plain text |
 | herdr waits do not track individual turns | A wait can return on an earlier turn's completion, or time out after delivery | Confirm the agent went `working` after each prompt; read the pane before retrying |
 | Supervisors die when herdr's server stops | Loops and runs stop silently | Journal and replay; `loops list` flags a loop whose supervisor is gone |
-| The embedded interpreter may not handle `async` and `await` well | The graph language depends on it | Fall back to blocking `agent()` calls, which only drops the `await` keyword |
+| The embedded interpreter may not handle `async` and `await` well | The graph language depends on it | Settled by spike 1: goja's promises work, and `parallel()` runs calls concurrently |
 | Parts of herdr's interface are unconfirmed | Event and socket docs were incomplete when read, and ID stability across restarts is undocumented | Check against `herdr api schema --json`; store agent names, not pane IDs |
 
 Spikes, in order:
 
-- [ ] Run a TypeScript file through embedded esbuild and goja, with `await` and a blocking Go function behind `agent()`.
+- [x] Run a TypeScript file through embedded esbuild and goja, with `await` and a blocking Go function behind `agent()`. See [the findings](docs/spikes/01-esbuild-goja.md).
 - [ ] Drive one agent end to end with the herdr CLI: start, prompt, wait, result file.
 - [ ] Kill a supervisor mid-run and resume it from the journal.
 - [ ] Confirm the binary cross-compiles and runs on macOS, Linux and Windows.
