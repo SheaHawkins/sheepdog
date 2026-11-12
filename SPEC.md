@@ -85,9 +85,11 @@ Sheepdog keeps OpenEngine's four nouns and maps each onto something herdr alread
 | --- | --- | --- |
 | Graph | A registered TypeScript file. Re-adding a changed file creates a new version; an identical file is a no-op | Nothing until it runs |
 | Run | One execution of one pinned graph version | One tab, with the supervisor in its root pane |
-| Node | One labelled agent in a run. The same label always means the same agent | One pane, started with `herdr agent start <run>-<label> --kind <kind>` |
+| Node | One labelled agent in a run. The same label always means the same agent | One pane, split from the supervisor's and started with `herdr agent start <name> --kind <kind> --pane <pane>` |
 | Node execution | One `agent()` call: a prompt sent to a node and its result | `herdr agent prompt … --wait`, then the result file or `herdr agent read` |
 | Loop | Recurring runs of one pinned version; runs never overlap | A supervisor pane that sleeps for `--every` and starts the next run |
+
+herdr agent names are at most 32 characters of `[a-z0-9_-]` and unique across the herdr server, so a label cannot be used directly. The agent's name is a short slug of the run and label plus a hash of both, such as `sh12fb6b4-security-review-28dc47` for `security-review/security` in run `mw3tqhh12fb6b4`, and the label is shown as the pane's title.
 
 A node can have many executions. That is how a cycle works: the second prompt to `implement` goes to the pane that wrote the code, with its context intact.
 
@@ -208,18 +210,20 @@ A run is the graph script executing inside a supervisor, with every completed `a
 
 1. `graph run` writes `run.json`, creates a herdr tab and starts the supervisor in its root pane.
 2. The supervisor strips the types, loads the script and runs it.
-3. On an `agent()` call for a new label, it splits a pane and starts the agent. For a known label it reuses the pane.
+3. On an `agent()` call for a new label, it splits a pane and starts the agent in it with `herdr agent start --pane`. For a known label it reuses the pane.
 4. It sends the prompt, waits for the agent to finish, and collects the result.
 5. It appends the call and its result to `journal.jsonl`, then returns the result to the script.
 6. When the script ends or throws, it marks the run `succeeded` or `failed` and leaves the tab open for inspection.
 
 **Results come from files, not the screen.** Each prompt ends with an instruction to write the result to a named file in the run directory. With a `schema`, a JSON Schema object, the file must be JSON that validates; the supervisor asks again up to twice before failing the call. Without one, the file's text is the result, and `herdr agent read` is the fallback if no file appears.
 
-**Blocked agents stop the call, not the run.** If herdr reports an agent as blocked on an approval or question, the run shows `blocked`, a herdr notification fires, and the supervisor waits. It never answers on the agent's behalf.
+**Blocked agents stop the call, not the run.** If herdr reports an agent as blocked on an approval or question, the run shows `blocked`, a herdr notification fires, and the supervisor waits. It never answers on the agent's behalf. The same applies to startup dialogs, such as a folder trust prompt, and to any screen herdr reports as `unknown`. herdr reports some startup dialogs as `idle`, so the supervisor also checks the screen for known dialog text before the first prompt. A prompt typed into a dialog is lost, and its Enter answers the dialog.
 
 **Resume is replay.** `run resume` starts a new supervisor that re-runs the script from the top. Calls already in the journal return their recorded results at once, so execution picks up at the first unfinished call. A journal entry is matched on label, prompt and position; a mismatch fails the resume instead of guessing.
 
-**Delivery is checked before any retry.** A timeout from herdr does not prove a prompt was not delivered, so the supervisor reads the pane before sending anything twice.
+**Turns are told apart by herdr's state counter.** Every agent reports `state_change_seq`, which only grows. The supervisor reads it before each prompt and accepts a finished state only once the counter has moved past that value.
+
+**Delivery is checked before any retry.** A timeout from herdr does not prove a prompt was not delivered. If the state counter has moved, the prompt landed and the supervisor keeps waiting. If it has not, the call fails rather than send the prompt twice. The pane cannot serve as evidence here, because herdr refuses long reads while an agent is working.
 
 Run statuses are `running`, `blocked`, `succeeded`, `failed` and `stopped`.
 
@@ -243,8 +247,8 @@ The design rests on five things that are not yet proven, and each has a small sp
 
 | Risk | Why it matters | Mitigation |
 | --- | --- | --- |
-| Agents may not write the result file reliably | Every branch in a graph depends on structured results | Retry with the validation error; fall back to reading the pane for plain text |
-| herdr waits do not track individual turns | A wait can return on an earlier turn's completion, or time out after delivery | Confirm the agent went `working` after each prompt; read the pane before retrying |
+| Agents may not write the result file reliably | Every branch in a graph depends on structured results | Retry with the validation error; fall back to reading the pane for plain text. Spike 2: claude and codex both wrote valid JSON |
+| herdr waits do not track individual turns | A wait can return on an earlier turn's completion, or time out after delivery | Settled by spike 2: compare `state_change_seq` before and after each prompt, and never resend without proof the first prompt was lost |
 | Supervisors die when herdr's server stops | Loops and runs stop silently | Journal and replay; `loops list` flags a loop whose supervisor is gone |
 | The embedded interpreter may not handle `async` and `await` well | The graph language depends on it | Settled by spike 1: goja's promises work, and `parallel()` runs calls concurrently |
 | Parts of herdr's interface are unconfirmed | Event and socket docs were incomplete when read, and ID stability across restarts is undocumented | Check against `herdr api schema --json`; store agent names, not pane IDs |
@@ -252,7 +256,7 @@ The design rests on five things that are not yet proven, and each has a small sp
 Spikes, in order:
 
 - [x] Run a TypeScript file through embedded esbuild and goja, with `await` and a blocking Go function behind `agent()`. See [the findings](docs/spikes/01-esbuild-goja.md).
-- [ ] Drive one agent end to end with the herdr CLI: start, prompt, wait, result file.
+- [x] Drive one agent end to end with the herdr CLI: start, prompt, wait, result file. See [the findings](docs/spikes/02-herdr-agent.md).
 - [ ] Kill a supervisor mid-run and resume it from the journal.
 - [ ] Confirm the binary cross-compiles and runs on macOS, Linux and Windows.
 
