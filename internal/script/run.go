@@ -15,6 +15,12 @@ type AgentOptions struct {
 	Kind    string         `json:"kind"`
 	Schema  map[string]any `json:"schema"`
 	Timeout string         `json:"timeout"`
+
+	// Seq is the call's position in the run, 1-based, in the order the script
+	// made its calls. The script is deterministic, so a replay numbers its
+	// calls the same way even when parallel() calls finish in another order.
+	// Set by the runtime, never by the script.
+	Seq int `json:"-"`
 }
 
 // Host is what a running script calls out to. Agent blocks until the node
@@ -88,6 +94,7 @@ func Run(ctx context.Context, p *Program, args map[string]any, host Host) (any, 
 			reject(rt.NewTypeError("agent(): label is required"))
 			return rt.ToValue(promise)
 		}
+		opts.Seq = calls
 		pending++
 		go func() {
 			result, err := host.Agent(ctx, prompt, opts)

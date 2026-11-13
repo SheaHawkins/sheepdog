@@ -46,6 +46,10 @@ type Executor struct {
 	AgentArgs    map[string][]string
 	StartTimeout time.Duration // default 60s
 	DialogPoll   time.Duration // how often to re-check a startup dialog; default 2s
+	// Grace is how long an agent known to exist may be missing before a call
+	// fails. herdr drops a restored agent's name briefly while it relaunches
+	// it after a restart. Default 30s.
+	Grace time.Duration
 	// MaxRetries is how many times an invalid or missing result file is asked
 	// for again. Default 2.
 	MaxRetries *int
@@ -61,14 +65,19 @@ type Executor struct {
 }
 
 type node struct {
-	mu   sync.Mutex
-	name string
-	kind string
-	pane string
+	mu    sync.Mutex
+	name  string
+	kind  string
+	pane  string
+	known bool // an earlier supervisor of this run started its agent
 }
 
 // Do runs one call and returns its result: the parsed JSON when the call has
 // a schema, otherwise the result text.
+//
+// Do can pick up a call that a previous supervisor started and did not
+// finish: the call's node directory already holds a prompt. It then works out
+// how far the call got instead of sending the prompt again blindly.
 func (e *Executor) Do(ctx context.Context, c Call) (any, error) {
 	if c.Timeout > 0 {
 		var cancel context.CancelFunc
@@ -81,11 +90,13 @@ func (e *Executor) Do(ctx context.Context, c Call) (any, error) {
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	dir := filepath.Join(e.RunDir, "nodes", c.ExecID)
+	if countPrompts(dir) > 0 {
+		n.known = true // a prompt was written, so the agent was started
+	}
 	if err := e.ensureStarted(ctx, n, c.Label); err != nil {
 		return nil, fmt.Errorf("start %s: %w", c.Label, err)
 	}
-
-	dir := filepath.Join(e.RunDir, "nodes", c.ExecID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -99,60 +110,66 @@ func (e *Executor) Do(ctx context.Context, c Call) (any, error) {
 			return nil, fmt.Errorf("%s: bad schema: %w", c.Label, err)
 		}
 	}
-
-	prompt := c.Prompt + resultInstruction(resultPath, c.Schema)
 	retries := 2
 	if e.MaxRetries != nil {
 		retries = *e.MaxRetries
 	}
-	for attempt := 0; ; attempt++ {
+
+	attempt := 0
+	prompt := c.Prompt + resultInstruction(resultPath, c.Schema)
+	if prior := countPrompts(dir); prior > 0 {
+		res, problem, delivered, err := e.recoverCall(ctx, n, c, dir, prior, resultPath, validator)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", c.Label, err)
+		}
+		switch {
+		case res != nil:
+			return res.v, nil
+		case delivered && problem != "":
+			// The agent got the last prompt and finished without a usable
+			// result: carry on as if that attempt had just failed.
+			if prior > retries {
+				if c.Schema == nil {
+					res, _, err := e.collect(ctx, n, c, dir, resultPath, validator, true)
+					if err != nil {
+						return nil, err
+					}
+					return res.v, nil
+				}
+				return nil, fmt.Errorf("%s: no valid result after %d attempts: %s", c.Label, prior, problem)
+			}
+			attempt = prior
+			prompt = problem + "\nWrite the result again." + resultInstruction(resultPath, c.Schema)
+		default:
+			// Never delivered: send the last prompt that was written.
+			attempt = prior - 1
+			raw, err := os.ReadFile(promptFile(dir, prior))
+			if err != nil {
+				return nil, err
+			}
+			prompt = string(raw)
+		}
+	}
+
+	for ; ; attempt++ {
 		// A file left by an earlier attempt must not count as this one's.
 		if err := os.Remove(resultPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
-		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("prompt-%d.md", attempt+1)), []byte(prompt), 0o644); err != nil {
+		// Written before sending, so a successor knows a prompt may be out.
+		if err := os.WriteFile(promptFile(dir, attempt+1), []byte(prompt), 0o644); err != nil {
 			return nil, err
 		}
 		if err := e.turn(ctx, n, c.Label, prompt); err != nil {
 			return nil, fmt.Errorf("%s: %w", c.Label, err)
 		}
 
-		raw, readErr := os.ReadFile(resultPath)
-		if c.Schema == nil {
-			if readErr == nil {
-				return string(raw), nil
-			}
-			// Fallback: the agent answered on screen instead.
-			e.logf("%s: no result file, reading the pane", c.Label)
-			text, err := e.Herdr.Read(ctx, n.name, 200)
-			if err != nil {
-				return nil, fmt.Errorf("%s: no result file and pane read failed: %w", c.Label, err)
-			}
-			_ = os.WriteFile(filepath.Join(dir, "output.txt"), []byte(text), 0o644)
-			return text, nil
+		res, problem, err := e.collect(ctx, n, c, dir, resultPath, validator, attempt >= retries)
+		if err != nil {
+			return nil, err
 		}
-
-		var problem string
-		var v any
-		switch {
-		case readErr != nil:
-			problem = fmt.Sprintf("No result file was written to %s.", resultPath)
-		default:
-			v, err = jsonschema.UnmarshalJSON(strings.NewReader(string(raw)))
-			if err != nil {
-				problem = fmt.Sprintf("The result file %s is not valid JSON: %v.", resultPath, err)
-			} else if err := validator.Validate(v); err != nil {
-				problem = fmt.Sprintf("The result file %s does not match the schema:\n%v", resultPath, err)
-			}
-		}
-		if problem == "" {
-			// Re-decode with encoding/json so numbers are float64, as JSON.parse
-			// would give the script.
-			var out any
-			if err := json.Unmarshal(raw, &out); err != nil {
-				return nil, err
-			}
-			return out, nil
+		if res != nil {
+			return res.v, nil
 		}
 		if attempt >= retries {
 			return nil, fmt.Errorf("%s: no valid result after %d attempts: %s", c.Label, attempt+1, problem)
@@ -160,6 +177,155 @@ func (e *Executor) Do(ctx context.Context, c Call) (any, error) {
 		e.logf("%s: %s Asking again.", c.Label, firstLine(problem))
 		prompt = problem + "\nWrite the result again." + resultInstruction(resultPath, c.Schema)
 	}
+}
+
+type result struct{ v any }
+
+// collect reads the result of a finished turn. It returns the result, or the
+// problem to send back to the agent.
+//
+// A plain-text call with no file is asked again like any other, and only the
+// last attempt falls back to the pane: a turn can end before the file is
+// written (claude can leave a background shell running to write it), and a
+// pane read returns the whole screen, not an answer.
+func (e *Executor) collect(ctx context.Context, n *node, c Call, dir, resultPath string, validator *jsonschema.Schema, last bool) (*result, string, error) {
+	raw, readErr := os.ReadFile(resultPath)
+	if c.Schema == nil {
+		if readErr == nil {
+			return &result{string(raw)}, "", nil
+		}
+		if !last {
+			return nil, fmt.Sprintf("No result file was written to %s.", resultPath), nil
+		}
+		e.logf("%s: still no result file, reading the pane", c.Label)
+		text, err := e.read(ctx, n.name, 200)
+		if err != nil {
+			return nil, "", fmt.Errorf("%s: no result file and pane read failed: %w", c.Label, err)
+		}
+		_ = os.WriteFile(filepath.Join(dir, "output.txt"), []byte(text), 0o644)
+		return &result{text}, "", nil
+	}
+	if readErr != nil {
+		return nil, fmt.Sprintf("No result file was written to %s.", resultPath), nil
+	}
+	v, err := jsonschema.UnmarshalJSON(strings.NewReader(string(raw)))
+	if err != nil {
+		return nil, fmt.Sprintf("The result file %s is not valid JSON: %v.", resultPath, err), nil
+	}
+	if err := validator.Validate(v); err != nil {
+		return nil, fmt.Sprintf("The result file %s does not match the schema:\n%v", resultPath, err), nil
+	}
+	// Re-decode with encoding/json so numbers are float64, as JSON.parse
+	// would give the script.
+	var out any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, "", err
+	}
+	return &result{out}, "", nil
+}
+
+// recoverCall works out how far a call a previous supervisor started got.
+// prior is the number of prompts it wrote; the last may or may not have been
+// sent. It returns a result if the agent finished with one, or whether the
+// last prompt was delivered and, if the turn ended, the problem with it.
+func (e *Executor) recoverCall(ctx context.Context, n *node, c Call, dir string, prior int, resultPath string, validator *jsonschema.Schema) (res *result, problem string, delivered bool, err error) {
+	e.logf("%s: resuming %s, which a previous supervisor started (%d prompt(s) written)", c.Label, c.ExecID, prior)
+	a, err := e.getAgent(ctx, n.name)
+	if err != nil {
+		return nil, "", false, err
+	}
+	// Let any turn in progress end first: it may be ours.
+	if a.Status == herdr.Blocked {
+		if a, err = e.waitOutBlocked(ctx, n, c.Label, a); err != nil {
+			return nil, "", false, err
+		}
+	}
+	if a.Status == herdr.Working || a.Status == herdr.Unknown {
+		e.logf("%s: agent is %s; waiting for its turn to end", c.Label, a.Status)
+		for a.Status != herdr.Idle && a.Status != herdr.Done {
+			if a.Status == herdr.Blocked {
+				a, err = e.waitOutBlocked(ctx, n, c.Label, a)
+			} else {
+				a, err = e.Herdr.Wait(ctx, n.name, remaining(ctx))
+			}
+			if err != nil {
+				return nil, "", false, err
+			}
+		}
+	}
+
+	// A result file can only come from a delivered prompt: it is deleted
+	// before every send.
+	if _, statErr := os.Stat(resultPath); statErr == nil {
+		res, problem, err := e.collect(ctx, n, c, dir, resultPath, validator, false)
+		if err != nil || res != nil {
+			if res != nil {
+				e.logf("%s: the turn ended with a result; using it", c.Label)
+			}
+			return res, "", true, err
+		}
+		return nil, problem, true, nil
+	}
+
+	// No file. The prompt names the result path, so the agent's history
+	// shows whether the prompt arrived. Wrapping can split the path across
+	// lines, so compare with all whitespace removed.
+	history, err := e.read(ctx, n.name, 2000)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("cannot tell whether %s was delivered (%v); not resending", c.ExecID, err)
+	}
+	if !strings.Contains(squeeze(history), squeeze(resultPath)) {
+		e.logf("%s: the last prompt never reached the agent; sending it", c.Label)
+		return nil, "", false, nil
+	}
+	return nil, fmt.Sprintf("No result file was written to %s.", resultPath), true, nil
+}
+
+func promptFile(dir string, n int) string {
+	return filepath.Join(dir, fmt.Sprintf("prompt-%d.md", n))
+}
+
+func countPrompts(dir string) int {
+	n := 0
+	for {
+		if _, err := os.Stat(promptFile(dir, n+1)); err != nil {
+			return n
+		}
+		n++
+	}
+}
+
+func squeeze(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\n' || r == '\t' || r == '\r' {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// Learn records a label's kind, for a label whose calls were replayed from
+// the journal, so later calls may leave the kind out. The agent itself is
+// found or started on the label's next live call.
+func (e *Executor) Learn(label, kind string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.nodes == nil {
+		e.nodes = map[string]*node{}
+	}
+	if _, ok := e.nodes[label]; !ok && kind != "" {
+		e.nodes[label] = &node{name: AgentName(e.RunID, label), kind: kind, known: true}
+	}
+}
+
+// KindOf returns the kind of a label's agent, or "" for an unknown label.
+func (e *Executor) KindOf(label string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if n, ok := e.nodes[label]; ok {
+		return n.kind
+	}
+	return ""
 }
 
 func (e *Executor) node(c Call) (*node, error) {
@@ -188,6 +354,29 @@ func (e *Executor) node(c Call) (*node, error) {
 func (e *Executor) ensureStarted(ctx context.Context, n *node, label string) error {
 	if n.pane != "" {
 		return nil
+	}
+	// The agent may already exist: a previous supervisor for this run started
+	// it. Names are derived from the run and label, so it can be found again,
+	// with its context intact.
+	get := e.Herdr.GetAgent
+	if n.known {
+		// The journal says this label had an agent. If herdr is still
+		// restoring panes after a restart, give the agent time to reappear
+		// rather than start a second one.
+		get = e.getAgent
+	}
+	if a, err := get(ctx, n.name); err == nil {
+		if a.Kind != n.kind {
+			return fmt.Errorf("agent %s is %s, but the label is %s", n.name, a.Kind, n.kind)
+		}
+		e.logf("%s: reusing agent %s in %s", label, n.name, a.PaneID)
+		n.pane = a.PaneID
+		e.mu.Lock()
+		e.lastPane = a.PaneID
+		e.mu.Unlock()
+		return nil
+	} else if !herdr.IsCode(err, herdr.CodeAgentNotFound) {
+		return err
 	}
 	e.mu.Lock()
 	from, dir := e.RootPane, "right"
@@ -296,7 +485,7 @@ func containsAny(s string, subs []string) bool {
 
 // turn sends one prompt and returns when the turn it started has ended.
 func (e *Executor) turn(ctx context.Context, n *node, label, prompt string) error {
-	before, err := e.Herdr.GetAgent(ctx, n.name)
+	before, err := e.getAgent(ctx, n.name)
 	if err != nil {
 		return err
 	}
@@ -390,6 +579,39 @@ func (e *Executor) waitOutBlocked(ctx context.Context, n *node, label string, a 
 func (e *Executor) logf(format string, args ...any) {
 	if e.Logf != nil {
 		e.Logf(format, args...)
+	}
+}
+
+// getAgent is GetAgent for an agent that should exist: agent_not_found is
+// retried for e.Grace.
+func (e *Executor) getAgent(ctx context.Context, name string) (herdr.Agent, error) {
+	var a herdr.Agent
+	err := e.graced(ctx, func() (err error) { a, err = e.Herdr.GetAgent(ctx, name); return })
+	return a, err
+}
+
+func (e *Executor) read(ctx context.Context, name string, lines int) (string, error) {
+	var s string
+	err := e.graced(ctx, func() (err error) { s, err = e.Herdr.Read(ctx, name, lines); return })
+	return s, err
+}
+
+func (e *Executor) graced(ctx context.Context, f func() error) error {
+	grace := e.Grace
+	if grace == 0 {
+		grace = 30 * time.Second
+	}
+	deadline := time.Now().Add(grace)
+	for {
+		err := f()
+		if !herdr.IsCode(err, herdr.CodeAgentNotFound) || time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Second):
+		}
 	}
 }
 

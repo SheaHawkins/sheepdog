@@ -24,6 +24,7 @@ type fake struct {
 	waits   []herdr.Status // what the next Wait calls return, in order
 	screen  string
 	screens []string // what successive Screen calls return
+	missing int      // GetAgent reports this many agent_not_found first
 	notes   int
 
 	respond func(f *fake, n int, prompt string) (herdr.Status, error)
@@ -76,7 +77,15 @@ func (f *fake) Wait(_ context.Context, name string, _ time.Duration, _ ...herdr.
 func (f *fake) GetAgent(_ context.Context, name string) (herdr.Agent, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return *f.agents[name], nil
+	a, ok := f.agents[name]
+	if f.missing > 0 {
+		f.missing--
+		ok = false
+	}
+	if !ok {
+		return herdr.Agent{}, &herdr.Error{Code: herdr.CodeAgentNotFound}
+	}
+	return *a, nil
 }
 func (f *fake) Read(context.Context, string, int) (string, error) { return f.screen, nil }
 func (f *fake) Screen(context.Context, string) (string, error) {
@@ -186,24 +195,37 @@ func TestSchemaGivesUp(t *testing.T) {
 }
 
 func TestStaleResultIgnored(t *testing.T) {
-	e := newExec(t, &fake{})
-	f := e.Herdr.(*fake)
-	// The first call writes a result; the second writes nothing, and must not
-	// read the first call's file even though it reuses the exec ID.
-	f.respond = func(f *fake, n int, p string) (herdr.Status, error) {
-		if n == 1 {
-			os.WriteFile(resultPath(t, p), []byte("first"), 0o644)
+	// Attempt 1 writes an invalid file and attempt 2 writes nothing. Attempt
+	// 2 must be told there is no file, not judged on attempt 1's.
+	f := &fake{respond: func(f *fake, n int, p string) (herdr.Status, error) {
+		switch n {
+		case 1:
+			os.WriteFile(resultPath(t, p), []byte(`{"file":1}`), 0o644)
+		case 3:
+			os.WriteFile(resultPath(t, p), []byte(`{"file":"a","lines":1}`), 0o644)
 		}
 		return herdr.Idle, nil
+	}}
+	if _, err := newExec(t, f).Do(context.Background(), Call{ExecID: "e1", Label: "x", Kind: "claude", Prompt: "p", Schema: schema}); err != nil {
+		t.Fatal(err)
 	}
-	f.screen = "from the pane"
+	if len(f.prompts) != 3 || !strings.HasPrefix(f.prompts[2], "No result file") {
+		t.Errorf("prompts: %q", f.prompts)
+	}
+}
+
+func TestPaneFallback(t *testing.T) {
+	f := &fake{respond: func(*fake, int, string) (herdr.Status, error) { return herdr.Idle, nil }, screen: "from the pane"}
+	e := newExec(t, f)
 	ctx := context.Background()
-	if got, _ := e.Do(ctx, Call{ExecID: "e1", Label: "x", Kind: "claude", Prompt: "p"}); got != "first" {
-		t.Fatalf("first = %v", got)
+	// No file ever: asked twice more, then the pane is read.
+	if got, _ := e.Do(ctx, Call{ExecID: "e1", Label: "x", Kind: "claude", Prompt: "p"}); got != "from the pane" {
+		t.Errorf("got %v", got)
 	}
-	if got, _ := e.Do(ctx, Call{ExecID: "e1", Label: "x", Prompt: "p"}); got != "from the pane" {
-		t.Errorf("second = %v, want the pane fallback", got)
+	if len(f.prompts) != 3 || !strings.HasPrefix(f.prompts[1], "No result file") {
+		t.Errorf("prompts: %q", f.prompts)
 	}
+	e.Do(ctx, Call{ExecID: "e2", Label: "x", Prompt: "p"})
 	if f.starts != 1 {
 		t.Errorf("started %d agents for one label", f.starts)
 	}

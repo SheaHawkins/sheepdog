@@ -251,3 +251,26 @@ func TestSplitHeader(t *testing.T) {
 		})
 	}
 }
+
+func TestSeqFollowsCallOrder(t *testing.T) {
+	p := mustCompile(t, "seq.ts")
+	var mu sync.Mutex
+	seqs := map[string]int{}
+	host := &fakeHost{respond: func(prompt string, opts AgentOptions, _ int) (any, error) {
+		// Finish in reverse issue order.
+		time.Sleep(time.Duration(4-opts.Seq) * 10 * time.Millisecond)
+		mu.Lock()
+		seqs[prompt] = opts.Seq
+		mu.Unlock()
+		return prompt, nil
+	}}
+	if _, err := Run(context.Background(), p, nil, host); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{"p3": 1, "p2": 2, "p1": 3, "last": 4}
+	for k, v := range want {
+		if seqs[k] != v {
+			t.Errorf("seq of %s = %d, want %d", k, seqs[k], v)
+		}
+	}
+}
