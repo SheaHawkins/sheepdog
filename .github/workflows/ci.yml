@@ -1,0 +1,107 @@
+name: CI
+
+# Builds and tests sheepdog on macOS, Linux and Windows, cross-compiles the
+# release targets, and checks that herdr itself runs headless on each OS.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      # The race detector needs cgo, and Windows runners have no C compiler
+      # set up for it.
+      - name: go test -race
+        if: runner.os != 'Windows'
+        run: go test -race ./...
+      - name: go test
+        if: runner.os == 'Windows'
+        run: go test ./...
+
+  build:
+    name: Cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build every release target
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 windows/amd64 windows/arm64; do
+            os=${target%/*} arch=${target#*/}
+            ext=""; [ "$os" = windows ] && ext=.exe
+            GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=${GITHUB_SHA::12}" \
+              -o "dist/sheepdog-$os-$arch$ext" ./cmd/sheepdog
+          done
+          ls -l dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sheepdog-binaries
+          path: dist/
+          retention-days: 14
+
+  herdr:
+    name: herdr headless (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Install herdr (macOS, Linux)
+        if: runner.os != 'Windows'
+        run: |
+          curl -fsSL https://herdr.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install herdr (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          irm https://herdr.dev/install.ps1 | iex
+          "$env:LOCALAPPDATA\Programs\Herdr\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Start a server, open a pane, run a command in it
+        shell: bash
+        run: |
+          herdr --version
+          herdr --session ci server > server.log 2>&1 &
+          for i in $(seq 1 60); do
+            herdr --session ci status server > /dev/null 2>&1 && break
+            sleep 1
+          done
+          herdr --session ci status server
+          pane=$(herdr --session ci workspace create --cwd "$PWD" --label ci --no-focus | jq -r .result.root_pane.pane_id)
+          echo "pane: $pane"
+          herdr --session ci pane run "$pane" "echo sheepdog-ci-ok"
+          # Anchored, so the echoed command line does not count.
+          herdr --session ci pane wait-output "$pane" --regex '(?m)^sheepdog-ci-ok\s*$' --timeout 30000 > /dev/null
+          echo "pane output:"
+          herdr --session ci pane read "$pane" --source recent
+          herdr --session ci server stop
+      - name: herdr server log
+        if: failure()
+        shell: bash
+        run: cat server.log || true
