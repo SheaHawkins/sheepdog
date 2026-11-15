@@ -2,7 +2,7 @@
 
 Question: does sheepdog build as one static binary for each OS, and does that binary run a graph on each?
 
-Status: **in progress.** The build question is settled. The run question is settled on macOS, covered by CI on Linux and Windows against a fake herdr, and still open for real agents on Linux and Windows.
+Status: **in progress.** The build question is settled. The run question is settled on macOS, covered by CI on Linux and Windows against a fake herdr, and still open for real agents on Linux and Windows. On all three OSes CI also starts a headless herdr server, opens a pane and runs a command in it.
 
 ## What was built
 
@@ -25,6 +25,8 @@ Status: **in progress.** The build question is settled. The run question is sett
 
 **The binary works end to end on macOS with real herdr and claude.** `examples/hello.ts`, with one plain-text call and one schema call, finished in 16s. `run resume` on the finished run replayed it in 0.03s without sending a prompt.
 
+**CRLF line endings shifted every error line by one.** The first CI run on Windows failed one test: a script error pointed at line 12 instead of 11. Windows checkouts convert files to CRLF. The compiler splits the imports and `meta` from the rest of the script and wraps the rest in an async function. That split fell between a CR and its LF, and JavaScript counts a lone CR as a line break, so the wrapper added a line. This would have hit anyone writing graphs on Windows. The compiler now converts CRLF to LF first, which JavaScript already treats as equivalent, even inside template literals. A test checks a CRLF copy of the file on every OS.
+
 **Windows path handling was already broken in a test.** The node tests located the result path with a regex that expected it to start with `/`, so they would have failed on Windows. Product code builds result paths with `filepath`, so it was not affected. CI on Windows is what catches this kind of bug.
 
 **Smaller observations:**
@@ -35,7 +37,7 @@ Status: **in progress.** The build question is settled. The run question is sett
 
 ## Still to do
 
-- [ ] CI green on all three runners.
+- [x] CI green on all three runners (after the CRLF fix).
 - [ ] Real agents on Windows: the spike 2 and 3 herdr tests. See below.
 - [ ] Real agents on Linux, in a container or on a machine.
 

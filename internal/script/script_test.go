@@ -3,6 +3,8 @@ package script
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -155,7 +157,30 @@ func TestMetaWithoutRunning(t *testing.T) {
 }
 
 func TestErrorsKeepOriginalLineNumbers(t *testing.T) {
-	p := mustCompile(t, "errors.ts")
+	testErrorLines(t, mustCompile(t, "errors.ts"))
+}
+
+// TestCRLFKeepsLineNumbers runs the same check on a CRLF copy, as a Windows
+// checkout would have, whatever line endings this checkout has.
+func TestCRLFKeepsLineNumbers(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("testdata", "errors.ts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	crlf := strings.ReplaceAll(strings.ReplaceAll(string(src), "\r\n", "\n"), "\n", "\r\n")
+	path := filepath.Join(t.TempDir(), "errors.ts")
+	if err := os.WriteFile(path, []byte(crlf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := Compile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testErrorLines(t, p)
+}
+
+func testErrorLines(t *testing.T, p *Program) {
+	t.Helper()
 	host := &fakeHost{respond: func(string, AgentOptions, int) (any, error) {
 		return nil, errors.New("agent exited")
 	}}
