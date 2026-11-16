@@ -114,7 +114,8 @@ func TestRenderGolden(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%v (run with -update to create it)", err)
 			}
-			if got != string(want) {
+			// Windows checkouts may turn the golden files' LF into CRLF.
+			if got != strings.ReplaceAll(string(want), "\r\n", "\n") {
 				t.Errorf("render differs from %s:\n%s", path, got)
 			}
 			for i, l := range lines {
