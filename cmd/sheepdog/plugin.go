@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +15,7 @@ import (
 // herdr sets these for actions, panes and startup hooks; see
 // docs/spikes/05-herdr-plugin.md for what each kind of command receives.
 type pluginEnv struct {
-	Session    string `json:"session"`     // HERDR_SESSION; "default" for the default session
+	Session    string `json:"session"`     // HERDR_SESSION; empty in the default session
 	Bin        string `json:"herdr_bin"`   // HERDR_BIN_PATH
 	Socket     string `json:"socket"`      // HERDR_SOCKET_PATH
 	PluginRoot string `json:"plugin_root"` // HERDR_PLUGIN_ROOT
@@ -90,15 +91,29 @@ func projectRoot(dir string) string {
 
 // pluginCmd is `sheepdog plugin ...`, the binary's entry point for herdr.
 // It is not in the usage text: people do not type these.
-func pluginCmd(args []string, stdout io.Writer) error {
-	if len(args) == 1 && args[0] == "doctor" {
-		e, err := readPluginEnv()
-		if err != nil {
-			return err
-		}
+func pluginCmd(ctx context.Context, args []string, stdout io.Writer) error {
+	if len(args) != 1 {
+		return fmt.Errorf("unknown plugin command %q", args)
+	}
+	e, err := readPluginEnv()
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "doctor":
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(e)
+	case "runs":
+		// The action opens the timeline pane; the pane gets the same
+		// context, so it shows the project the user was in.
+		pluginID := os.Getenv("HERDR_PLUGIN_ID")
+		return herdrClient("").Exec(ctx, "plugin", "pane", "open", "--plugin", pluginID, "--entrypoint", "watch")
+	case "watch":
+		if e.Project == "" {
+			return errors.New("no project: open this pane from a pane in your project")
+		}
+		return watch(ctx, e.Project, "", herdrClient(""), os.Stdin, stdout)
 	}
-	return fmt.Errorf("unknown plugin command %q", args)
+	return fmt.Errorf("unknown plugin command %q", args[0])
 }

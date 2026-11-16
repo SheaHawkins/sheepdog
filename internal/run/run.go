@@ -31,6 +31,7 @@ const (
 // Record is run.json.
 type Record struct {
 	ID       string         `json:"id"`
+	Graph    string         `json:"graph,omitempty"` // meta.name
 	Status   string         `json:"status"`
 	Script   string         `json:"script"`
 	Args     map[string]any `json:"args"`
@@ -38,6 +39,7 @@ type Record struct {
 	Error    string         `json:"error,omitempty"`
 	PID      int            `json:"supervisor_pid,omitempty"`
 	Attempts int            `json:"attempts"` // supervisors that have driven this run
+	Started  time.Time      `json:"started"`
 	Updated  time.Time      `json:"updated"`
 }
 
@@ -102,6 +104,14 @@ func Execute(ctx context.Context, cfg Config) (any, error) {
 		}
 	}
 	rec.Attempts++
+	if rec.Started.IsZero() {
+		rec.Started = time.Now().UTC()
+	}
+	if meta, err := script.Meta(cfg.Program); err == nil {
+		if name, ok := meta["name"].(string); ok {
+			rec.Graph = name
+		}
+	}
 	rec.Status, rec.PID, rec.Error, rec.Result = Running, os.Getpid(), "", nil
 	if err := writeRecord(cfg.Dir, &rec); err != nil {
 		return nil, err
@@ -133,7 +143,7 @@ func Execute(ctx context.Context, cfg Config) (any, error) {
 		rec.Error = err.Error()
 	}
 	rec.PID = 0
-	ev.log("%s", rec.Status)
+	ev.emit(Event{Type: RunStatus}, "%s", rec.Status)
 	if werr := writeRecord(cfg.Dir, &rec); werr != nil && err == nil {
 		err = werr
 	}
@@ -149,7 +159,7 @@ type host struct {
 	ev      *events
 }
 
-func (h *host) Log(msg string) { h.ev.log("log: %s", msg) }
+func (h *host) Log(msg string) { h.ev.emit(Event{Type: Log}, "log: %s", msg) }
 
 func (h *host) Agent(ctx context.Context, prompt string, opts script.AgentOptions) (any, error) {
 	sha := promptSHA(prompt)
@@ -180,14 +190,20 @@ func (h *host) Agent(ctx context.Context, prompt string, opts script.AgentOption
 		}
 		timeout = d
 	}
-	h.ev.log("%s: call %d (%s)", opts.Label, opts.Seq, execID)
+	kind := opts.Kind
+	if kind == "" {
+		kind = h.cfg.Executor.KindOf(opts.Label)
+	}
+	h.ev.emit(Event{Type: CallStarted, Seq: opts.Seq, Label: opts.Label, Kind: kind, ExecID: execID},
+		"%s: call %d (%s)", opts.Label, opts.Seq, execID)
 	v, err := h.cfg.Executor.Do(ctx, node.Call{
 		ExecID: execID, Label: opts.Label, Kind: opts.Kind,
 		Prompt: prompt, Schema: opts.Schema, Timeout: timeout,
 	})
 	if err != nil {
 		// Failures are not journaled: a resume tries the call again.
-		h.ev.log("%s: call %d failed: %v", opts.Label, opts.Seq, err)
+		h.ev.emit(Event{Type: CallFailed, Seq: opts.Seq, Label: opts.Label, ExecID: execID, Error: err.Error()},
+			"%s: call %d failed: %v", opts.Label, opts.Seq, err)
 		return nil, err
 	}
 	raw, err := json.Marshal(v)
@@ -202,7 +218,8 @@ func (h *host) Agent(ctx context.Context, prompt string, opts script.AgentOption
 		h.cancel(err)
 		return nil, err
 	}
-	h.ev.log("%s: call %d done", opts.Label, opts.Seq)
+	h.ev.emit(Event{Type: CallDone, Seq: opts.Seq, Label: opts.Label, ExecID: execID},
+		"%s: call %d done", opts.Label, opts.Seq)
 	return v, nil
 }
 
@@ -258,11 +275,34 @@ func openEvents(path string) (*events, error) {
 	return &events{f: f}, nil
 }
 
-func (e *events) log(format string, args ...any) {
-	b, _ := json.Marshal(struct {
-		Time    time.Time `json:"time"`
-		Message string    `json:"msg"`
-	}{time.Now().UTC(), fmt.Sprintf(format, args...)})
+// Event is one line of events.jsonl. Every line has a time and a message for
+// people; call lifecycle lines also carry a type and the call's fields, so
+// viewers need not parse messages.
+type Event struct {
+	Time    time.Time `json:"time"`
+	Message string    `json:"msg"`
+	Type    string    `json:"type,omitempty"`
+	Seq     int       `json:"seq,omitempty"`
+	Label   string    `json:"label,omitempty"`
+	Kind    string    `json:"kind,omitempty"`
+	ExecID  string    `json:"exec_id,omitempty"`
+	Error   string    `json:"error,omitempty"`
+}
+
+// Event types.
+const (
+	CallStarted = "call_started"
+	CallDone    = "call_done"
+	CallFailed  = "call_failed"
+	RunStatus   = "run_status" // Message is the new status
+	Log         = "log"        // the script called log(); Message is "log: " + its text
+)
+
+func (e *events) log(format string, args ...any) { e.emit(Event{}, format, args...) }
+
+func (e *events) emit(ev Event, format string, args ...any) {
+	ev.Time, ev.Message = time.Now().UTC(), fmt.Sprintf(format, args...)
+	b, _ := json.Marshal(ev)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.f.Write(append(b, '\n'))

@@ -1,0 +1,31 @@
+# sheepdog as a herdr plugin. See SPEC.md, "herdr plugin".
+#
+# For now this is for development: build the binary into bin/ and link the
+# repository.
+#   go build -o bin/sheepdog ./cmd/sheepdog
+#   herdr plugin link "$PWD"
+# Installing from GitHub, which downloads a release binary, comes later.
+id = "sheepdog"
+name = "Sheepdog"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Run TypeScript graphs of coding agents, once or on a loop"
+platforms = ["linux", "macos", "windows"]
+
+[[actions]]
+id = "runs"
+title = "Sheepdog: show runs"
+contexts = ["workspace"]
+command = ["bin/sheepdog", "plugin", "runs"]
+
+[[actions]]
+id = "doctor"
+title = "Sheepdog: doctor"
+contexts = ["workspace"]
+command = ["bin/sheepdog", "plugin", "doctor"]
+
+[[panes]]
+id = "watch"
+title = "sheepdog"
+placement = "split"
+command = ["bin/sheepdog", "plugin", "watch"]
