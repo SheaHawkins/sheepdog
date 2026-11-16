@@ -1,17 +1,18 @@
 # Sheepdog spec
 
-Shea Hawkins · November 9, 2026
+Shea Hawkins · November 9, 2026 · updated November 16, 2026: sheepdog ships as a herdr plugin
 
 ## Summary
 
-Sheepdog is a single static binary that runs graphs of coding agents inside [herdr](https://herdr.dev/docs/), once or on a recurring loop. Its CLI mirrors [OpenEngine's `oe`](https://github.com/OpenEngine/OpenEngine), without the daemon, database or web UI.
+Sheepdog runs graphs of coding agents inside [herdr](https://herdr.dev/docs/), once or on a recurring loop. It ships as a [herdr plugin](https://herdr.dev/tui/docs/plugins/) around a single static binary. The plugin adds sheepdog to herdr's keybindings, panes and server startup. The binary does the work, and its CLI mirrors [OpenEngine's `oe`](https://github.com/OpenEngine/OpenEngine), without the daemon, database or web UI.
 
 Graphs are written in TypeScript: small script files modelled on Claude's workflow scripts, where a review cycle is an ordinary `for` loop.
 
 | Decision | Choice |
 | --- | --- |
-| Distribution | One static Go binary for macOS, Linux and Windows; the only runtime dependency is `herdr` on the PATH |
-| Runtime | No daemon. Each run or loop is a supervisor process in a herdr pane |
+| Distribution | A herdr plugin, installed with `herdr plugin install SheaHawkins/sheepdog`. Its install step fetches one static Go binary for macOS, Linux or Windows, which also works on its own |
+| Runtime | No daemon. Each run or loop is a supervisor process in a herdr pane. The plugin's startup hook restarts supervisors after herdr restarts |
+| In herdr | Plugin actions to run a graph and watch runs, bound to keys; a runs pane |
 | State | Plain JSON and JSONL files under `.sheepdog/` |
 | herdr link | Shell out to the `herdr` CLI and parse its JSON |
 | Graph language | TypeScript files, cycles allowed |
@@ -24,10 +25,10 @@ V1 does one job: run a graph of herdr agents to completion, once or on a schedul
 
 Goals:
 
-- One binary, copied onto a machine that has herdr, is the whole install.
+- `herdr plugin install SheaHawkins/sheepdog` is the whole install. Copying the binary onto a machine with herdr still works, for scripts and CI.
 - Commands and flags match `oe` wherever the feature exists, so habits transfer.
 - Graphs can contain cycles, such as security findings going to a validator and back to the implementer.
-- A run survives a crash or a herdr restart and resumes at the first unfinished step.
+- A run survives a crash or a herdr restart and resumes at the first unfinished step. After a herdr restart, this happens without anyone typing a command.
 - Every piece of state is a readable file.
 
 Not in v1:
@@ -37,14 +38,17 @@ Not in v1:
 - Budgets and forge integration, which move to v2.
 - Reading OpenEngine's `graph.yaml` files.
 - npm packages or Node APIs inside graph files.
+- UI beyond terminal panes. herdr's plugin v1 has no native plugin UI, so sheepdog's views are terminal programs in panes.
 
 ## Architecture
 
-Sheepdog is one Go binary that plays two roles: the CLI you type, and a supervisor process that runs a graph inside a herdr pane. There is no daemon; herdr's server is what keeps supervisors alive.
+Sheepdog is one Go binary that plays two roles: the CLI, and a supervisor process that runs a graph inside a herdr pane. The herdr plugin is a manifest that tells herdr when to run that binary: on a keypress, in a pane, or when the server starts. There is no daemon; herdr's server is what keeps supervisors alive.
 
 ```mermaid
 flowchart LR
-  cli[sheepdog CLI] -->|starts in a pane| sup[Supervisor: runs the graph]
+  keys[herdr keybinding or action] -->|runs| cli[sheepdog CLI]
+  startup[herdr startup hook] -->|runs| cli
+  cli -->|starts in a pane| sup[Supervisor: runs the graph]
   sup -->|calls| herdr[herdr CLI]
   herdr -->|drives| agents[Agent panes]
   cli -->|reads| state[(.sheepdog/ state files)]
@@ -57,7 +61,7 @@ Three things are compiled into the binary:
 
 - **esbuild**, which strips TypeScript types and bundles relative imports.
 - **goja**, a pure-Go JavaScript interpreter that executes the result.
-- **A herdr adapter**, one small interface implemented by spawning `herdr` and parsing its JSON. A socket implementation can replace it later without touching anything else.
+- **A herdr adapter**, one small interface implemented by spawning `herdr` and parsing its JSON. Inside herdr it runs the binary named by `HERDR_BIN_PATH`, which herdr sets for plugin commands, so it reaches the right server over a Unix socket or a Windows named pipe alike. A socket implementation can replace it later without touching anything else.
 
 State is plain files, written by temp-file-and-rename so a crash never leaves a half-written record:
 
@@ -77,6 +81,8 @@ Run history stays local. The first command that creates `.sheepdog/` also writes
 
 `loops/` is ignored the same way, because it holds state, not definitions. A graph's `meta.loop` declares the schedule. The file under `loops/` only records that the loop is switched on in this checkout, which graph version it pinned, whether it is paused and when it last ran. A restarted loop supervisor needs that record to avoid running twice.
 
+One file lives outside the project: a per-user registry of live supervisors, at `sheepdog/supervisors.json` under the OS's user state directory. Each entry has a project directory, a run or loop, its herdr session and its pane. Supervisors add themselves when they start and remove themselves when they finish. herdr plugins are installed per user and start without a project, so the startup hook needs this file to find the runs and loops it should restart.
+
 ## Concepts
 
 Sheepdog keeps OpenEngine's four nouns and maps each onto something herdr already provides.
@@ -87,7 +93,7 @@ Sheepdog keeps OpenEngine's four nouns and maps each onto something herdr alread
 | Run | One execution of one pinned graph version | One tab, with the supervisor in its root pane |
 | Node | One labelled agent in a run. The same label always means the same agent | One pane, split from the supervisor's and started with `herdr agent start <name> --kind <kind> --pane <pane>` |
 | Node execution | One `agent()` call: a prompt sent to a node and its result | `herdr agent prompt … --wait`, then the result file or `herdr agent read` |
-| Loop | Recurring runs of one pinned version; runs never overlap | A supervisor pane that sleeps for `--every` and starts the next run |
+| Loop | Recurring runs of one pinned version; runs never overlap | A supervisor pane that sleeps for `--every` and starts the next run. The plugin's startup hook restarts it after a herdr restart |
 
 herdr agent names are at most 32 characters of `[a-z0-9_-]` and unique across the herdr server, so a label cannot be used directly. The agent's name is a short slug of the run and label plus a hash of both, such as `sh12fb6b4-security-review-28dc47` for `security-review/security` in run `mw3tqhh12fb6b4`, and the label is shown as the pane's title.
 
@@ -167,6 +173,82 @@ if (review.confirmed.length > 0) {
 - **Limits are shared.** Child calls count toward the caller's `maxCalls`, and nesting stops at 8 levels, which also catches a graph that calls itself.
 - **A child's `meta.loop` is ignored.** Only the graph a loop was added for runs on a schedule.
 
+## herdr plugin
+
+The repository root holds `herdr-plugin.toml`, so `herdr plugin install SheaHawkins/sheepdog` installs it. Every command it declares runs the sheepdog binary; the plugin holds no logic of its own.
+
+```toml
+id = "sheepdog"
+name = "Sheepdog"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Run TypeScript graphs of coding agents, once or on a loop"
+platforms = ["linux", "macos", "windows"]
+
+[[build]]                      # fetch the release binary for this platform
+command = ["sh", "install.sh"]
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "install.ps1"]
+platforms = ["windows"]
+
+[[startup]]                    # restart supervisors after herdr restarts
+command = ["bin/sheepdog", "plugin", "startup"]
+
+[[actions]]
+id = "run"
+title = "Run a graph"
+contexts = ["workspace"]
+command = ["bin/sheepdog", "plugin", "run"]
+
+[[actions]]
+id = "runs"
+title = "Show runs"
+contexts = ["workspace"]
+command = ["bin/sheepdog", "plugin", "runs"]
+
+[[panes]]
+id = "picker"                  # choose a graph and type an instruction
+title = "Run a graph"
+placement = "popup"
+command = ["bin/sheepdog", "plugin", "picker"]
+
+[[panes]]
+id = "watch"                   # live runs and their events
+title = "Sheepdog runs"
+placement = "split"
+command = ["bin/sheepdog", "plugin", "watch"]
+```
+
+Windows normally finds `bin\sheepdog.exe` when asked for `bin/sheepdog`. Spike 5 checks that herdr's launcher does too; if it doesn't, the manifest repeats each entry with a `platforms` list.
+
+**Install fetches a binary rather than building one.** herdr runs `[[build]]` commands at install, but does not install toolchains, so requiring Go would make Go a dependency. The install scripts download the release binary for the platform from the repository's GitHub releases, check its SHA-256 against a checksum file in the release, and put it in `bin/`. The release tag matches the plugin version. A release workflow, built from CI's cross-build job, publishes the six binaries and the checksum file. `herdr plugin install` shows these commands for review before it runs them. `herdr plugin link` is for development: it runs no build step, so a developer runs `go build -o bin/sheepdog ./cmd/sheepdog` first.
+
+**Actions find the project from the pane.** Plugin commands run with the plugin's directory as their working directory, and plugins are installed per user, not per project. An action reads the focused pane from `HERDR_PANE_ID` or `HERDR_PLUGIN_CONTEXT_JSON`, asks `herdr pane get` for its `cwd`, and walks up to the nearest directory with `.sheepdog/`, else the git root, else the `cwd` itself.
+
+**`sheepdog plugin` is the binary's entry point for herdr.** Its subcommands are hidden from help:
+
+| Subcommand | Called by | Does |
+| --- | --- | --- |
+| `plugin run` | The `run` action | Opens the `picker` popup in the action's project |
+| `plugin picker` | The `picker` pane | Lists the project's graphs, takes an instruction and inputs, then does what `graph run` does |
+| `plugin runs` | The `runs` action | Opens the `watch` pane |
+| `plugin watch` | The `watch` pane | A live table of the project's runs, and the event log of the selected one |
+| `plugin startup` | The startup hook | Restarts the supervisors herdr's restart killed. See [Run lifecycle](#run-lifecycle) |
+
+Users bind actions to keys in herdr's own config:
+
+```toml
+[[keys.command]]
+key = "prefix+g"
+type = "plugin_action"
+command = "sheepdog.run"
+description = "run a sheepdog graph"
+```
+
+**The plugin is optional.** The binary does everything from a shell too. The plugin adds keybindings, panes and automatic restarts, so most people will want it.
+
 ## CLI
 
 The v1 surface is `oe`'s graph, run, loop and node commands under the name `sheepdog`. List commands print tables, or JSON with `--json`.
@@ -202,18 +284,18 @@ Differences in behaviour:
 - `run watch` tails the run's event log. Focusing the run's tab in herdr shows the agents themselves.
 - `node steer` sends a message to the live agent behind that execution with `herdr agent prompt`. It is refused if the agent is blocked.
 - `--every` accepts `m`, `h` and `d` units.
-- The global flag `--session NAME` passes through to herdr.
+- The global flag `--session NAME` passes through to herdr. Inside herdr it is rarely needed, because sheepdog uses `HERDR_BIN_PATH` and herdr's socket from its environment.
 
 ## Run lifecycle
 
 A run is the graph script executing inside a supervisor, with every completed `agent()` call written to a journal before the script moves on.
 
-1. `graph run` writes `run.json`, creates a herdr tab and starts the supervisor in its root pane.
+1. `graph run` writes `run.json`, creates a herdr tab and starts `sheepdog run resume RUN_ID` in its root pane, then returns the run ID. Starting a run is resuming one whose journal is empty, so there is one code path. The supervisor registers itself in `supervisors.json`.
 2. The supervisor strips the types, loads the script and runs it.
 3. On an `agent()` call for a new label, it splits a pane and starts the agent in it with `herdr agent start --pane`. For a known label it reuses the pane.
 4. It sends the prompt, waits for the agent to finish, and collects the result.
 5. It appends the call and its result to `journal.jsonl`, then returns the result to the script.
-6. When the script ends or throws, it marks the run `succeeded` or `failed` and leaves the tab open for inspection.
+6. When the script ends or throws, it marks the run `succeeded` or `failed`, removes itself from `supervisors.json`, and leaves the tab open for inspection.
 
 **Results come from files, not the screen.** Each prompt ends with an instruction to write the result to a named file in the run directory. With a `schema`, a JSON Schema object, the file must be JSON that validates; the supervisor asks again up to twice before failing the call. Without one, the file's text is the result. A missing file is asked for again the same way, and `herdr agent read` is the fallback only after that: a turn can end before its file is written, and a pane read returns the whole screen.
 
@@ -224,6 +306,8 @@ A run is the graph script executing inside a supervisor, with every completed `a
 **The call in flight is recovered, not repeated.** Agent names come from the run and label, so the new supervisor finds the existing agent and keeps its conversation. Each prompt is saved in the node's directory before it is sent, and the result file is deleted first. So on resume the supervisor waits out any turn in progress, then uses a result file if there is one. If there isn't, it checks the agent's history for the prompt to decide whether to ask for the file again or send the prompt. If it cannot tell, the call fails.
 
 **One supervisor per run.** A lock file in the run directory holds the supervisor's process ID. A lock left by a dead process is taken over.
+
+**A herdr restart resumes runs by itself.** Stopping herdr's server kills every supervisor, and herdr restores their panes as plain shells. When the server comes back, the plugin's startup hook reads `supervisors.json` and keeps the entries for its own herdr session. For each run that is still `running` with no live supervisor, it starts `sheepdog run resume RUN_ID` again: in the run's old pane if herdr restored it, otherwise in a new tab. Loops that are switched on get their loop supervisor back the same way. The hook only starts these commands and exits, because herdr runs startup hooks once and expects them to leave no background processes. A supervisor killed some other way, such as by a machine crash or a closed pane, still waits for `run resume`, and `runs` flags it: status `running` with no live supervisor.
 
 **Turns are told apart by herdr's state counter.** Every agent reports `state_change_seq`, which only grows. The supervisor reads it before each prompt and accepts a finished state only once the counter has moved past that value.
 
@@ -247,13 +331,14 @@ Also deferred to v2 or later: the `go`, `review` and `fix` verbs, named agent pr
 
 ## Risks and first spikes
 
-The design rests on five things that are not yet proven, and each has a small spike that settles it.
+The design rests on six things that are not yet proven, and each has a small spike that settles it.
 
 | Risk | Why it matters | Mitigation |
 | --- | --- | --- |
 | Agents may not write the result file reliably | Every branch in a graph depends on structured results | Retry with the validation error; fall back to reading the pane for plain text. Spike 2: claude and codex both wrote valid JSON |
 | herdr waits do not track individual turns | A wait can return on an earlier turn's completion, or time out after delivery | Settled by spike 2: compare `state_change_seq` before and after each prompt, and never resend without proof the first prompt was lost |
-| Supervisors die when herdr's server stops | Loops and runs stop silently | Journal and replay; `loops list` flags a loop whose supervisor is gone. Spike 3: herdr restores claude agents with their conversations, but not codex agents or the supervisor itself |
+| Supervisors die when herdr's server stops | Loops and runs stop silently | Journal and replay, and the plugin's startup hook resumes them; `runs` and `loops list` flag a supervisor that is gone. Spike 3: herdr restores claude agents with their conversations, but not codex agents or the supervisor itself |
+| herdr's plugin interface is new | The plugin's install, actions and startup hook depend on it | Use only manifest fields and the CLI, set `min_herdr_version`, and keep the plugin optional: the binary works without it. Spike 5 checks the parts sheepdog relies on |
 | The embedded interpreter may not handle `async` and `await` well | The graph language depends on it | Settled by spike 1: goja's promises work, and `parallel()` runs calls concurrently |
 | Parts of herdr's interface are unconfirmed | Event and socket docs were incomplete when read, and ID stability across restarts is undocumented | Check against `herdr api schema --json`; store agent names, not pane IDs |
 
@@ -262,9 +347,10 @@ Spikes, in order:
 - [x] Run a TypeScript file through embedded esbuild and goja, with `await` and a blocking Go function behind `agent()`. See [the findings](docs/spikes/01-esbuild-goja.md).
 - [x] Drive one agent end to end with the herdr CLI: start, prompt, wait, result file. See [the findings](docs/spikes/02-herdr-agent.md).
 - [x] Kill a supervisor mid-run and resume it from the journal. See [the findings](docs/spikes/03-resume.md).
-- [ ] Confirm the binary cross-compiles and runs on macOS, Linux and Windows.
+- [ ] Confirm the binary cross-compiles and runs on macOS, Linux and Windows. In progress: builds and CI pass on all three; real agents are tested only on macOS so far. See [the findings](docs/spikes/04-cross-platform.md).
+- [ ] Run sheepdog as a herdr plugin: link a local manifest, start a run from an action in the focused pane's project, and stop and restart herdr's server mid-run so the startup hook resumes the run with no command typed. Also check `plugin install` fetching the binary, on macOS and Windows.
 
 ## Sources
 
 - [OpenEngine repository](https://github.com/OpenEngine/OpenEngine) and its [CLI README](https://raw.githubusercontent.com/OpenEngine/OpenEngine/HEAD/cli/README.md)
-- herdr [CLI reference](https://herdr.dev/tui/docs/cli-reference/), [agent automation](https://herdr.dev/tui/docs/agent-automation/) and [socket API](https://herdr.dev/tui/docs/socket-api/)
+- herdr [CLI reference](https://herdr.dev/tui/docs/cli-reference/), [agent automation](https://herdr.dev/tui/docs/agent-automation/), [socket API](https://herdr.dev/tui/docs/socket-api/) and [plugins](https://herdr.dev/tui/docs/plugins/)
