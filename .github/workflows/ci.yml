@@ -105,3 +105,58 @@ jobs:
         if: failure()
         shell: bash
         run: cat server.log || true
+
+  plugin:
+    name: herdr plugin (${{ matrix.os }})
+    # Links a minimal plugin whose commands run bin/sheepdog, then checks that
+    # herdr launches it from the plugin directory (bin\sheepdog.exe on
+    # Windows) for a startup hook and an action, and what it passes in.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install herdr (macOS, Linux)
+        if: runner.os != 'Windows'
+        run: |
+          curl -fsSL https://herdr.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install herdr (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          irm https://herdr.dev/install.ps1 | iex
+          "$env:LOCALAPPDATA\Programs\Herdr\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Link the plugin, start herdr, invoke an action
+        shell: bash
+        run: |
+          ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
+          mkdir -p "$RUNNER_TEMP/plugin/bin"
+          cp cmd/sheepdog/testdata/plugin/herdr-plugin.toml "$RUNNER_TEMP/plugin/"
+          go build -o "$RUNNER_TEMP/plugin/bin/sheepdog$ext" ./cmd/sheepdog
+          # Linked before the server starts, so its startup hook runs. This
+          # is the default session, which checks HERDR_SESSION there too.
+          herdr plugin link "$RUNNER_TEMP/plugin"
+          herdr server > server.log 2>&1 &
+          for i in $(seq 1 60); do herdr status server > /dev/null 2>&1 && break; sleep 1; done
+          herdr workspace create --cwd "$PWD" --label ci --no-focus > /dev/null
+          herdr plugin action invoke sheepdog-ci.doctor > /dev/null
+          for i in $(seq 1 30); do
+            herdr plugin log list --plugin sheepdog-ci > logs.json
+            [ "$(jq '[.result.logs[] | select(.status != "running")] | length' logs.json)" -ge 2 ] && break
+            sleep 1
+          done
+          jq -r '.result.logs[] | "== \(.event // "action") \(.command | join(" ")): \(.status) (exit \(.exit_code))\n\(.stdout)\(.stderr)"' logs.json
+          # Both ran, exited 0 and printed what herdr passed in.
+          jq -e '[.result.logs[] | select(.status == "succeeded" and .exit_code == 0)] | length == 2' logs.json
+          jq -e '[.result.logs[].stdout | fromjson | .plugin_root != ""] | all' logs.json
+          herdr server stop
+      - name: herdr server log
+        if: failure()
+        shell: bash
+        run: cat server.log || true

@@ -63,6 +63,8 @@ func cli(ctx context.Context, argv []string, stdout, stderr io.Writer) error {
 		return nil
 	case len(args) >= 3 && args[0] == "graph" && args[1] == "run":
 		return graphRun(ctx, *session, args[2:], stdout, stderr)
+	case len(args) >= 2 && args[0] == "plugin":
+		return pluginCmd(args[1:], stdout)
 	case len(args) == 3 && args[0] == "run" && args[1] == "resume":
 		return runResume(ctx, *session, args[2], stdout, stderr)
 	}
@@ -145,7 +147,9 @@ func execute(ctx context.Context, session, dir, id string, p *script.Program, in
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	h := &herdr.CLI{Session: session}
+	// Inside herdr, HERDR_BIN_PATH names the herdr binary of the server that
+	// launched us; outside it is unset and the CLI finds herdr on the PATH.
+	h := &herdr.CLI{Bin: os.Getenv("HERDR_BIN_PATH"), Session: session}
 	ws, err := h.CreateWorkspace(ctx, cwd, "sheepdog "+id)
 	if err != nil {
 		return fmt.Errorf("creating a herdr workspace: %w", err)
