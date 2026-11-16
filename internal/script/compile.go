@@ -42,7 +42,12 @@ func Compile(path string) (*Program, error) {
 	if err != nil {
 		return nil, err
 	}
-	header, body, err := splitHeader(string(src))
+	// Windows checkouts have CRLF line endings. The split below can fall
+	// between a CR and its LF, and a lone CR is a line break in JavaScript,
+	// so the wrapper would shift every later line by one. JavaScript already
+	// treats CRLF as LF, even inside template literals, so this changes no
+	// program's meaning.
+	header, body, err := splitHeader(strings.ReplaceAll(string(src), "\r\n", "\n"))
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}

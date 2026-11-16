@@ -108,7 +108,7 @@ func (f *fake) Notify(context.Context, string, string) error {
 // resultPath pulls the result file path out of a prompt.
 func resultPath(t *testing.T, prompt string) string {
 	t.Helper()
-	m := regexp.MustCompile(`(?m)^(/.*/result\.(?:json|txt))$`).FindStringSubmatch(prompt)
+	m := regexp.MustCompile(`(?m)^(.*[/\\]result\.(?:json|txt))\r?$`).FindStringSubmatch(prompt)
 	if m == nil {
 		t.Fatalf("no result path in prompt:\n%s", prompt)
 	}
