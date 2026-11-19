@@ -1,0 +1,18 @@
+# A minimal plugin for CI: checks that herdr launches bin/sheepdog from the
+# plugin directory on every OS (bin\sheepdog.exe on Windows) and what it
+# passes to startup hooks and actions. The real manifest is at the repo root.
+id = "sheepdog-ci"
+name = "Sheepdog CI"
+version = "0.0.0"
+min_herdr_version = "0.9.5"
+description = "CI check for sheepdog's plugin entry point"
+platforms = ["linux", "macos", "windows"]
+
+[[startup]]
+command = ["bin/sheepdog", "plugin", "doctor"]
+
+[[actions]]
+id = "doctor"
+title = "Sheepdog doctor"
+contexts = ["workspace"]
+command = ["bin/sheepdog", "plugin", "doctor"]

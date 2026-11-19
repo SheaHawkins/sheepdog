@@ -241,3 +241,14 @@ func (c *CLI) Screen(ctx context.Context, name string) (string, error) {
 func (c *CLI) Notify(ctx context.Context, title, body string) error {
 	return c.run(ctx, nil, "notification", "show", title, "--body", body, "--sound", "request")
 }
+
+// Focus brings an agent's pane into view in attached herdr clients.
+func (c *CLI) Focus(ctx context.Context, name string) error {
+	return c.run(ctx, nil, "agent", "focus", name)
+}
+
+// Exec runs any herdr command whose output sheepdog does not need.
+func (c *CLI) Exec(ctx context.Context, args ...string) error {
+	_, err := c.exec(ctx, nil, args...)
+	return err
+}

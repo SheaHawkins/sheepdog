@@ -88,6 +88,14 @@ func TestSmoke(t *testing.T) {
 		}
 	}
 
+	// Not on a terminal, run watch prints the timeline once.
+	out, _ = sheepdog("run", "watch", id)
+	for _, want := range []string{"smoke", "succeeded", "✓ planner", "check-a", "check-b", "echo: plan the thing"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("run watch output lacks %q:\n%s", want, out)
+		}
+	}
+
 	// A finished run replays from its journal without prompting anyone.
 	out, _ = sheepdog("run", "resume", id)
 	check(out)

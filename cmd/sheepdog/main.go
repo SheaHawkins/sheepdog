@@ -33,6 +33,7 @@ var version = "dev"
 const usage = `usage:
   sheepdog [--session NAME] graph run FILE.ts ["instruction"] [-i KEY=VALUE]...
   sheepdog [--session NAME] run resume RUN_ID
+  sheepdog [--session NAME] run watch [RUN_ID]
   sheepdog version
 
 Runs live in .sheepdog/runs/ under the current directory. The run ID goes to
@@ -63,6 +64,18 @@ func cli(ctx context.Context, argv []string, stdout, stderr io.Writer) error {
 		return nil
 	case len(args) >= 3 && args[0] == "graph" && args[1] == "run":
 		return graphRun(ctx, *session, args[2:], stdout, stderr)
+	case len(args) >= 2 && args[0] == "plugin":
+		return pluginCmd(ctx, args[1:], stdout)
+	case (len(args) == 2 || len(args) == 3) && args[0] == "run" && args[1] == "watch":
+		id := ""
+		if len(args) == 3 {
+			id = args[2]
+		}
+		project, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+		return watch(ctx, projectRoot(project), id, herdrClient(*session), os.Stdin, stdout)
 	case len(args) == 3 && args[0] == "run" && args[1] == "resume":
 		return runResume(ctx, *session, args[2], stdout, stderr)
 	}
@@ -145,16 +158,22 @@ func execute(ctx context.Context, session, dir, id string, p *script.Program, in
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	h := &herdr.CLI{Session: session}
-	ws, err := h.CreateWorkspace(ctx, cwd, "sheepdog "+id)
-	if err != nil {
-		return fmt.Errorf("creating a herdr workspace: %w", err)
+	h := herdrClient(session)
+	// Run from a herdr pane, the agents split beside it. Anywhere else they
+	// get a workspace of their own.
+	root := os.Getenv("HERDR_PANE_ID")
+	if root == "" || session != "" && session != os.Getenv("HERDR_SESSION") {
+		ws, err := h.CreateWorkspace(ctx, cwd, "sheepdog "+id)
+		if err != nil {
+			return fmt.Errorf("creating a herdr workspace: %w", err)
+		}
+		root = ws.PaneID
 	}
 	logf := run.Logf(dir)
 	result, err := run.Execute(ctx, run.Config{
 		Dir: dir, ID: id, Program: p, Args: inputs,
 		Executor: &node.Executor{
-			Herdr: h, RunID: id, RunDir: dir, Cwd: cwd, RootPane: ws.PaneID,
+			Herdr: h, RunID: id, RunDir: dir, Cwd: cwd, RootPane: root,
 			Logf: logf,
 		},
 	})
@@ -164,6 +183,16 @@ func execute(ctx context.Context, session, dir, id string, p *script.Program, in
 	enc := json.NewEncoder(stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(result)
+}
+
+// herdrClient returns the herdr CLI for a session. Inside herdr,
+// HERDR_BIN_PATH names the binary of the server that launched us and
+// HERDR_SESSION its session; outside, herdr is found on the PATH.
+func herdrClient(session string) *herdr.CLI {
+	if session == "" {
+		session = os.Getenv("HERDR_SESSION")
+	}
+	return &herdr.CLI{Bin: os.Getenv("HERDR_BIN_PATH"), Session: session}
 }
 
 // stateDir returns .sheepdog in the current directory, creating it with the
